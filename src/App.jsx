@@ -3,7 +3,7 @@ import Prism from 'prismjs';
 import 'prismjs/components/prism-python';
 import 'prismjs/themes/prism-tomorrow.css';
 import { supabase } from './lib/supabase';
-
+import confetti from 'canvas-confetti';
 const INITIAL_QUEST = {
   level: 1,
   title: "Level 1: The First Words",
@@ -34,7 +34,24 @@ export default function App() {
   const [pyodide, setPyodide] = useState(null);
   const [isLoadingEngine, setIsLoadingEngine] = useState(true);
   const [xp, setXp] = useState(100);
+  const [isMuted, setIsMuted] = useState(true);
+  const [bgAudio] = useState(() => {
+    // Free royalty-free ambient game music track
+    const audio = new Audio('https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3');
+    audio.loop = true;
+    audio.volume = 0.15; // Set low/soft volume (15%)
+    return audio;
+  });
 
+  const toggleSound = () => {
+    if (isMuted) {
+      bgAudio.play().catch(() => { });
+      setIsMuted(false);
+    } else {
+      bgAudio.pause();
+      setIsMuted(true);
+    }
+  };
   // Gameplay & Trackers
   const [currentLevel, setCurrentLevel] = useState(1);
   const [currentQuest, setCurrentQuest] = useState(INITIAL_QUEST);
@@ -165,6 +182,57 @@ export default function App() {
   };
 
   // Run Code Execution Engine
+  // Trigger side poppers confetti
+  const triggerVictoryPoppers = () => {
+    // Left popper
+    confetti({
+      particleCount: 50,
+      angle: 60,
+      spread: 55,
+      origin: { x: 0, y: 0.7 }
+    });
+    // Right popper
+    confetti({
+      particleCount: 50,
+      angle: 120,
+      spread: 55,
+      origin: { x: 1, y: 0.7 }
+    });
+  };
+  // Play a quick 1-second victory sound effect using Web Audio API
+  const playVictorySound = () => {
+    try {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+      const ctx = new AudioContext();
+
+      // Notes for a classic victory jingle (C5, E5, G5, C6)
+      const notes = [523.25, 659.25, 783.99, 1046.50];
+      const duration = 0.18; // ~0.7 seconds total duration
+
+      notes.forEach((freq, index) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.type = 'triangle'; // Gives a warm game synth tone
+        osc.frequency.value = freq;
+
+        const startTime = ctx.currentTime + index * duration;
+        const stopTime = startTime + duration;
+
+        gain.gain.setValueAtTime(0.15, startTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, stopTime);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc.start(startTime);
+        osc.stop(stopTime);
+      });
+    } catch (e) {
+      console.log('Audio playback error:', e);
+    }
+  };
   const runCode = async () => {
     if (!pyodide) return;
     setStatus('⏳ Running code...');
@@ -184,6 +252,8 @@ sys.stdout = io.StringIO()
       if (printedOutput === currentQuest.expectedOutput) {
         setIsTimerRunning(false);
         setIsLevelCleared(true);
+        triggerVictoryPoppers();
+        playVictorySound();
 
         // Calculate Star Rating based on speed (<45s = 3 stars) and 1st attempt
         let earnedStars = 1;
@@ -336,7 +406,40 @@ sys.stdout = io.StringIO()
       console.log('Database sync offline.');
     }
   };
+  const handlePlayerLogin = async (e) => {
+    e.preventDefault();
+    const cleanName = inputUsername.trim();
+    if (!cleanName) return;
 
+    setUsername(cleanName);
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('username', cleanName)
+          .maybesingle();
+
+        if (data && !error) {
+          if (data.total_xp !== undefined) setXp(data.total_xp);
+          if (data.completed_quests && data.completed_quests.length > 0) {
+            const lastLevel = Math.max(...data.completed_quests);
+            setCurrentLevel(lastLevel);
+          }
+        } else {
+          await supabase.from('profiles').upsert(
+            { username: cleanName, total_xp: 100, completed_quests: [1] },
+            { onConflict: 'username' }
+          );
+        }
+      } catch (err) {
+        console.log('Error loading player profile:', err);
+      }
+    }
+
+    setIsRegistered(true);
+  };
   return (
     <div className="h-screen w-screen bg-slate-950 text-white flex flex-col font-sans overflow-hidden relative">
       {/* Registration Modal Overlay */}
@@ -346,13 +449,7 @@ sys.stdout = io.StringIO()
             <h2 className="text-3xl font-black text-amber-400 mb-2">🐍 PYTHON QUEST</h2>
             <p className="text-slate-300 text-sm mb-6">Enter a player username to save progress & synchronize stats with the database.</p>
 
-            <form onSubmit={(e) => {
-              e.preventDefault();
-              if (inputUsername.trim()) {
-                setUsername(inputUsername.trim());
-                setIsRegistered(true);
-              }
-            }}>
+            <form onSubmit={handlePlayerLogin}>
               <input
                 type="text"
                 placeholder="Enter Username (e.g. ShadowCoder)"
@@ -375,6 +472,13 @@ sys.stdout = io.StringIO()
       <header className="h-16 bg-slate-900 border-b border-slate-800 px-6 flex justify-between items-center shrink-0">
         <div className="flex items-center gap-3">
           <h1 className="text-xl font-black text-amber-400 tracking-wide">🐍 PYTHON QUEST</h1>
+          <button
+            onClick={toggleSound}
+            className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-mono transition border border-slate-700 flex items-center gap-1.5"
+            title="Toggle Background Music"
+          >
+            {isMuted ? '🔇 Music Off' : '🎵 Music On'}
+          </button>
           <span className="text-xs bg-slate-800 border border-slate-700 text-slate-300 px-2.5 py-1 rounded-full font-bold">
             {currentQuest.title}
           </span>
@@ -527,6 +631,34 @@ sys.stdout = io.StringIO()
           </div>
           <div className="text-xs text-slate-300 font-sans leading-relaxed">
             {helperFeedback && renderTaskDescription(helperFeedback.replace(/\*\*/g, ''))}
+          </div>
+        </div>
+      )}
+      {/* Victory Pop-up Dialog */}
+      {isLevelCleared && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border-2 border-amber-500/50 p-8 rounded-3xl max-w-sm w-full shadow-2xl text-center relative animate-bounce-short">
+            <h2 className="text-3xl font-black text-amber-400 mb-1">LEVEL CLEARED!</h2>
+            <p className="text-slate-400 text-xs font-mono uppercase mb-6">Quest Completed</p>
+
+            {/* Stars Display */}
+            <div className="flex justify-center items-center gap-2 text-5xl mb-6">
+              <span className={stars >= 1 ? "scale-110 transition-transform duration-300" : "opacity-30 grayscale"}>⭐</span>
+              <span className={stars >= 2 ? "scale-125 transition-transform duration-300" : "opacity-30 grayscale"}>⭐</span>
+              <span className={stars >= 3 ? "scale-110 transition-transform duration-300" : "opacity-30 grayscale"}>⭐</span>
+            </div>
+
+            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 text-xs font-mono mb-6 text-slate-300">
+              {stars === 3 ? "🏆 Perfect Speed & 1st Attempt!" : stars === 2 ? "⚡ Great Timing!" : "👍 Well Done!"}
+            </div>
+
+            <button
+              onClick={generateNextQuest}
+              disabled={isGeneratingNext}
+              className="w-full bg-amber-500 hover:bg-amber-600 text-slate-950 font-black py-4 rounded-2xl text-lg transition shadow-lg hover:scale-105"
+            >
+              {isGeneratingNext ? '🤖 Loading Next...' : 'Next Level →'}
+            </button>
           </div>
         </div>
       )}
