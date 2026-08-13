@@ -76,33 +76,6 @@ export default function App() {
   const [inputUsername, setInputUsername] = useState('');
   const [isRegistered, setIsRegistered] = useState(false);
 
-  // API Key State (Persisted in browser localStorage for GitHub Pages / Local)
-  const [geminiApiKey, setGeminiApiKey] = useState(() => {
-    return localStorage.getItem('PYTHON_QUEST_GEMINI_KEY') ||
-      import.meta.env.VITE_GEMINI_API_KEY ||
-      import.meta.env.VITE_GEMINI_API_KEY_TEACHER ||
-      '';
-  });
-  const [inputApiKey, setInputApiKey] = useState(() => {
-    return localStorage.getItem('PYTHON_QUEST_GEMINI_KEY') ||
-      import.meta.env.VITE_GEMINI_API_KEY ||
-      import.meta.env.VITE_GEMINI_API_KEY_TEACHER ||
-      '';
-  });
-  const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
-
-  const saveCustomApiKey = (keyToSave) => {
-    const clean = keyToSave.trim();
-    setGeminiApiKey(clean);
-    setInputApiKey(clean);
-    if (clean) {
-      localStorage.setItem('PYTHON_QUEST_GEMINI_KEY', clean);
-    } else {
-      localStorage.removeItem('PYTHON_QUEST_GEMINI_KEY');
-    }
-    setIsKeyModalOpen(false);
-  };
-
   // Timer Ref
   useEffect(() => {
     let interval = null;
@@ -176,11 +149,8 @@ export default function App() {
   // ----------------------------------------------------
   const triggerAiHelper = async (errorMessage) => {
     try {
-      const keyHelper = geminiApiKey || import.meta.env.VITE_GEMINI_API_KEY_HELPER || import.meta.env.VITE_GEMINI_API_KEY;
-      if (!keyHelper) {
-        console.warn("Helper API Key missing. Please set your Gemini key.");
-        return;
-      }
+      const keyHelper = import.meta.env.VITE_GEMINI_API_KEY_HELPER || import.meta.env.VITE_GEMINI_API_KEY;
+      if (!keyHelper) return;
 
       const prompt = `Student Task: "${currentQuest.description}"
       Student Code:
@@ -335,17 +305,10 @@ sys.stdout = io.StringIO()
     const nextLevelNum = currentLevel + 1;
     const isCapstone = nextLevelNum >= 5; // Level 5+ triggers Capstone Real-World API
 
-    // Choose key based on level progression & custom user key
-    const apiKey = geminiApiKey || (isCapstone
+    // Choose key based on level progression
+    const apiKey = isCapstone
       ? (import.meta.env.VITE_GEMINI_API_KEY_CAPSTONE || import.meta.env.VITE_GEMINI_API_KEY)
-      : (import.meta.env.VITE_GEMINI_API_KEY_TEACHER || import.meta.env.VITE_GEMINI_API_KEY));
-
-    if (!apiKey) {
-      setIsKeyModalOpen(true);
-      setStatus('⚠️ Gemini API key required to generate custom quests. Please set your key.');
-      setIsGeneratingNext(false);
-      return;
-    }
+      : (import.meta.env.VITE_GEMINI_API_KEY_TEACHER || import.meta.env.VITE_GEMINI_API_KEY);
 
     const prompt = isCapstone
       ? `You are an Advanced Software Engineer. Generate Level ${nextLevelNum}: A REAL-WORLD INDUSTRY PROBLEM.
@@ -502,46 +465,15 @@ sys.stdout = io.StringIO()
             <h2 className="text-3xl font-black text-amber-400 mb-2">🐍 PYTHON QUEST</h2>
             <p className="text-slate-300 text-sm mb-6">Enter a player username to save progress & synchronize stats with the database.</p>
 
-            <form onSubmit={(e) => {
-              if (inputApiKey.trim()) {
-                saveCustomApiKey(inputApiKey);
-              }
-              handlePlayerLogin(e);
-            }}>
-              <div className="text-left mb-3">
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">Player Username</label>
-                <input
-                  type="text"
-                  placeholder="e.g. ShadowCoder"
-                  value={inputUsername}
-                  onChange={(e) => setInputUsername(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-amber-500 font-mono text-sm"
-                  required
-                />
-              </div>
-
-              <div className="text-left mb-5">
-                <div className="flex justify-between items-center mb-1">
-                  <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Gemini API Key</label>
-                  <a
-                    href="https://aistudio.google.com/app/apikey"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs text-amber-400 hover:underline"
-                  >
-                    Get Free Key ↗
-                  </a>
-                </div>
-                <input
-                  type="password"
-                  placeholder="Paste Gemini API Key (stored in browser)"
-                  value={inputApiKey}
-                  onChange={(e) => setInputApiKey(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-amber-500 font-mono text-sm"
-                />
-                <p className="text-[11px] text-slate-500 mt-1">Saved only in your browser storage. Never uploaded to GitHub.</p>
-              </div>
-
+            <form onSubmit={handlePlayerLogin}>
+              <input
+                type="text"
+                placeholder="Enter Username (e.g. ShadowCoder)"
+                value={inputUsername}
+                onChange={(e) => setInputUsername(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-amber-500 mb-4 text-center font-mono"
+                required
+              />
               <button
                 type="submit"
                 className="w-full bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-black py-3.5 rounded-xl transition text-base"
@@ -562,13 +494,6 @@ sys.stdout = io.StringIO()
             title="Toggle Background Music"
           >
             {isMuted ? '🔇 Music Off' : '🎵 Music On'}
-          </button>
-          <button
-            onClick={() => setIsKeyModalOpen(true)}
-            className={`px-3 py-1.5 rounded-xl text-xs font-mono transition border flex items-center gap-1.5 ${geminiApiKey ? 'bg-slate-800 border-emerald-500/40 text-emerald-400 hover:bg-slate-700' : 'bg-amber-500/10 border-amber-500/50 text-amber-400 hover:bg-amber-500/20'}`}
-            title="Configure Gemini API Key"
-          >
-            {geminiApiKey ? '🟢 Key Active' : '🔑 Set Gemini Key'}
           </button>
           <span className="text-xs bg-slate-800 border border-slate-700 text-slate-300 px-2.5 py-1 rounded-full font-bold">
             {currentQuest.title}
@@ -750,70 +675,6 @@ sys.stdout = io.StringIO()
             >
               {isGeneratingNext ? '🤖 Loading Next...' : 'Next Level →'}
             </button>
-          </div>
-        </div>
-      )}
-
-      {/* API Key Settings Modal Dialog */}
-      {isKeyModalOpen && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl max-w-md w-full shadow-2xl relative">
-            <div className="flex justify-between items-center mb-3 border-b border-slate-800 pb-3">
-              <h3 className="text-base font-black text-amber-400 flex items-center gap-2">
-                🔑 Gemini API Key Configuration
-              </h3>
-              <button
-                onClick={() => setIsKeyModalOpen(false)}
-                className="text-slate-400 hover:text-white font-bold text-lg"
-              >
-                ✕
-              </button>
-            </div>
-
-            <p className="text-xs text-slate-300 mb-4 leading-relaxed">
-              To generate AI tutor feedback and dynamic quests on GitHub Pages without leaking secrets to Git, save your Gemini key directly in your browser.
-            </p>
-
-            <div className="mb-4">
-              <label className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
-                Gemini API Key
-              </label>
-              <input
-                type="password"
-                placeholder="Paste Gemini API Key (e.g. AIzaSy... or AQ...)"
-                value={inputApiKey}
-                onChange={(e) => setInputApiKey(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-white focus:outline-none focus:border-amber-500 font-mono text-sm"
-              />
-              <div className="flex justify-between items-center mt-2">
-                <span className="text-[11px] text-slate-500">🔒 Stored only in localStorage</span>
-                <a
-                  href="https://aistudio.google.com/app/apikey"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-xs text-amber-400 hover:underline"
-                >
-                  Get Free Key ↗
-                </a>
-              </div>
-            </div>
-
-            <div className="flex gap-2">
-              <button
-                onClick={() => saveCustomApiKey(inputApiKey)}
-                className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-black py-2.5 rounded-xl transition text-sm"
-              >
-                Save API Key
-              </button>
-              {geminiApiKey && (
-                <button
-                  onClick={() => saveCustomApiKey('')}
-                  className="px-4 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 font-bold py-2.5 rounded-xl transition text-xs"
-                >
-                  Clear Key
-                </button>
-              )}
-            </div>
           </div>
         </div>
       )}
