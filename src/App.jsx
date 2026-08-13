@@ -150,7 +150,10 @@ export default function App() {
   const triggerAiHelper = async (errorMessage) => {
     try {
       const keyHelper = import.meta.env.VITE_GEMINI_API_KEY_HELPER || import.meta.env.VITE_GEMINI_API_KEY;
-      if (!keyHelper) return;
+      if (!keyHelper) {
+        console.warn("Helper API Key missing in environment variables.");
+        return;
+      }
 
       const prompt = `Student Task: "${currentQuest.description}"
       Student Code:
@@ -163,7 +166,7 @@ export default function App() {
       2. The exact conceptual fix without giving away the direct full code answer.`;
 
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${keyHelper}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${keyHelper}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -172,12 +175,16 @@ export default function App() {
       );
 
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error?.message || `API error (${response.status})`);
+      }
+
       if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
         setHelperFeedback(data.candidates[0].content.parts[0].text);
         setIsHelperOpen(true);
       }
     } catch (e) {
-      console.error("Helper API Error:", e);
+      console.error("Helper API Error:", e.message || e);
     }
   };
 
@@ -347,8 +354,12 @@ sys.stdout = io.StringIO()
          }`;
 
     try {
+      if (!apiKey) {
+        throw new Error("Gemini API key is not configured in environment variables.");
+      }
+
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -357,6 +368,14 @@ sys.stdout = io.StringIO()
       );
 
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error?.message || `API Error (${response.status})`);
+      }
+
+      if (!data.candidates?.[0]?.content?.parts?.[0]?.text) {
+        throw new Error("Invalid response format received from Gemini API.");
+      }
+
       const rawText = data.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim();
       const nextQuest = JSON.parse(rawText);
 
@@ -365,7 +384,7 @@ sys.stdout = io.StringIO()
       setUserCode(nextQuest.starterCode);
       setStatus(`🎯 Level ${nextLevelNum} (${isCapstone ? '🚀 Capstone' : '📖 Guided'}) Ready!`);
     } catch (err) {
-      console.error("Task Generator Error:", err);
+      console.error("Task Generator Error:", err.message || err);
       const fallbackQuest = {
         level: nextLevelNum,
         title: `Level ${nextLevelNum}: Working with Variables`,
