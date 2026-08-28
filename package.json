@@ -3,19 +3,14 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "homepage": "https://b25bs1115-eng.github.io/python-quest-game",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "preview": "vite preview",
-    "predeploy": "npm run build",
-    "deploy": "gh-pages -d dist"
+    "preview": "vite preview"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.111.0",
-    "canvas-confetti": "^1.9.4",
-    "prismjs": "^1.30.0",
+    "@supabase/supabase-js": "^2.49.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
@@ -24,7 +19,6 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.4",
     "autoprefixer": "^10.5.4",
-    "gh-pages": "^6.3.0",
     "oxlint": "^1.75.0",
     "postcss": "^8.5.25",
     "tailwindcss": "^3.4.19",

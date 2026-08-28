@@ -1,683 +1,775 @@
-import React, { useState, useEffect, useRef } from 'react';
-import Prism from 'prismjs';
-import 'prismjs/components/prism-python';
-import 'prismjs/themes/prism-tomorrow.css';
-import { supabase } from './lib/supabase';
-import confetti from 'canvas-confetti';
-const INITIAL_QUEST = {
-  level: 1,
-  title: "Level 1: The First Words",
-  topic: "Printing & Strings",
-  description: "Welcome to Python Quest! Write a line of code that prints `Hello, World!` to start your journey.",
-  starterCode: `# Write your print statement below\n`,
-  expectedOutput: "Hello, World!",
-  hint: "Use print('Hello, World!')"
-};
-
-// Highlights ONLY backticked words (e.g. `name` or `print()`)
-const renderTaskDescription = (text) => {
-  if (!text) return null;
-  const parts = text.split(/(`[^`]+`)/g);
-  return parts.map((part, index) => {
-    if (part.startsWith('`') && part.endsWith('`')) {
-      return (
-        <span key={index} className="text-lg font-extrabold text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20 font-mono inline-block my-0.5">
-          {part.slice(1, -1)}
-        </span>
-      );
-    }
-    return part;
-  });
-};
+import React, { useState, useEffect, useCallback } from 'react';
+import LevelMap from './components/LevelMap';
+import VictoryModal from './components/VictoryModal';
+import LeaderboardModal from './components/LeaderboardModal';
+import LoginScreen from './components/LoginScreen';
+import { starterQuests } from './data/quests';
+import { generateNextCapstoneQuest } from './utils/capstoneGenerator';
+import {
+  generateGeminiHint,
+  generateGeminiCapstoneProject,
+  generateGeminiTaskName
+} from './services/geminiService';
+import {
+  loadPlayerProgress,
+  savePlayerProgress,
+  verifyOrRegisterPlayer,
+  getActiveSession,
+  setActiveSession,
+  clearActiveSession
+} from './services/playerService';
 
 export default function App() {
+  const [session, setSession] = useState(() => getActiveSession());
+  const [isLoggedIn, setIsLoggedIn] = useState(() => !!getActiveSession());
+  const [playerName, setPlayerName] = useState(() => getActiveSession()?.playerName || '');
+  const [playerDob, setPlayerDob] = useState(() => getActiveSession()?.dob || '');
+  const [authError, setAuthError] = useState('');
+
+  const [currentView, setCurrentView] = useState('map'); // 'map' | 'game'
   const [pyodide, setPyodide] = useState(null);
   const [isLoadingEngine, setIsLoadingEngine] = useState(true);
-  const [xp, setXp] = useState(100);
-  const [isMuted, setIsMuted] = useState(true);
-  const [bgAudio] = useState(() => {
-    // Free royalty-free ambient game music track
-    const audio = new Audio('https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3');
-    audio.loop = true;
-    audio.volume = 0.15; // Set low/soft volume (15%)
-    return audio;
-  });
+  const [isLoadingPlayer, setIsLoadingPlayer] = useState(false);
+  const [quests, setQuests] = useState(starterQuests);
+  const [currentQuestIndex, setCurrentQuestIndex] = useState(0);
+  const [completedLevels, setCompletedLevels] = useState([]);
+  const [spentXp, setSpentXp] = useState(0);
+  const [aiHints, setAiHints] = useState({}); // { [questId]: hintString }
+  const [isLoadingAiHint, setIsLoadingAiHint] = useState(false);
+  const [hintNotification, setHintNotification] = useState('');
+  const [userCode, setUserCode] = useState(starterQuests[0].starterCode);
+  const [status, setStatus] = useState('Your Python quest begins.');
+  const [output, setOutput] = useState('');
+  const [feedback, setFeedback] = useState('Solve the challenge to unlock the next realm stage.');
+  const [isGeneratingTask, setIsGeneratingTask] = useState(false);
+  const [showVictoryModal, setShowVictoryModal] = useState(false);
+  const [showLeaderboardModal, setShowLeaderboardModal] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('saved'); // 'saved' | 'syncing'
 
-  const toggleSound = () => {
-    if (isMuted) {
-      bgAudio.play().catch(() => { });
-      setIsMuted(false);
-    } else {
-      bgAudio.pause();
-      setIsMuted(true);
-    }
-  };
-  // Gameplay & Trackers
-  const [currentLevel, setCurrentLevel] = useState(1);
-  const [currentQuest, setCurrentQuest] = useState(INITIAL_QUEST);
-  const [userCode, setUserCode] = useState(INITIAL_QUEST.starterCode);
-  const [status, setStatus] = useState('');
-  const [unlockedHints, setUnlockedHints] = useState([]);
-  const [isLevelCleared, setIsLevelCleared] = useState(false);
-  const [isGeneratingNext, setIsGeneratingNext] = useState(false);
+  const currentQuest = quests[currentQuestIndex] || quests[0];
+  const progressPercent = Math.round((completedLevels.length / quests.length) * 100);
 
-  // Performance Trackers
-  const [attempts, setAttempts] = useState(0);
-  const [timer, setTimer] = useState(0);
-  const [isTimerRunning, setIsTimerRunning] = useState(true);
-  const [stars, setStars] = useState(0);
+  // Total gross XP earned from completed quests
+  const grossXp = completedLevels.reduce((sum, qId) => {
+    const q = quests.find((item) => item.id === qId);
+    return sum + (q?.xp || 100);
+  }, 0);
 
-  // Pop-up AI Helper State
-  const [helperFeedback, setHelperFeedback] = useState(null);
-  const [isHelperOpen, setIsHelperOpen] = useState(false);
+  // Net player XP after spending on Gemini hints
+  const playerTotalXp = Math.max(0, grossXp - spentXp);
+  const playerTotalStars = completedLevels.length * 3;
 
-  // Player Registration State
-  const [username, setUsername] = useState('');
-  const [inputUsername, setInputUsername] = useState('');
-  const [isRegistered, setIsRegistered] = useState(false);
-
-  // Timer Ref
-  useEffect(() => {
-    let interval = null;
-    if (isTimerRunning) {
-      interval = setInterval(() => setTimer((t) => t + 1), 1000);
-    } else {
-      clearInterval(interval);
-    }
-    return () => clearInterval(interval);
-  }, [isTimerRunning]);
-
-  // Pyodide WASM Engine Setup
+  // Initialize Pyodide WebAssembly engine
   useEffect(() => {
     async function initPyodide() {
-      try {
-        if (window.loadPyodide) {
+      if (window.loadPyodide) {
+        try {
           const py = await window.loadPyodide();
           setPyodide(py);
           setIsLoadingEngine(false);
-        } else {
-          const script = document.createElement("script");
-          script.src = "https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js";
-          script.onload = async () => {
-            const py = await window.loadPyodide();
-            setPyodide(py);
-            setIsLoadingEngine(false);
-          };
-          document.body.appendChild(script);
+        } catch (err) {
+          console.error("Failed to load Pyodide engine:", err);
+          setIsLoadingEngine(false);
         }
-      } catch (e) {
-        console.error("Pyodide loading error:", e);
       }
     }
+
     initPyodide();
   }, []);
 
-  // Keyboard Auto-Indentation & Tab Handling
-  const handleKeyDown = (e) => {
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      const start = e.target.selectionStart;
-      const end = e.target.selectionEnd;
-      const newCode = userCode.substring(0, start) + '    ' + userCode.substring(end);
-      setUserCode(newCode);
-      setTimeout(() => {
-        e.target.selectionStart = e.target.selectionEnd = start + 4;
-      }, 0);
-    }
-
-    if (e.key === 'Enter') {
-      const start = e.target.selectionStart;
-      const lines = userCode.substring(0, start).split('\n');
-      const currentLine = lines[lines.length - 1];
-      const currentIndent = currentLine.match(/^\s*/)[0];
-      const endsWithColon = currentLine.trim().endsWith(':');
-      const indentToApply = currentIndent + (endsWithColon ? '    ' : '');
-
-      if (indentToApply.length > 0) {
-        e.preventDefault();
-        const newCode = userCode.substring(0, start) + '\n' + indentToApply + userCode.substring(start);
-        setUserCode(newCode);
-        setTimeout(() => {
-          e.target.selectionStart = e.target.selectionEnd = start + 1 + indentToApply.length;
-        }, 0);
-      }
-    }
-  };
-
-  // ----------------------------------------------------
-  // API KEY 2: AI HELPER AGENT (Pop-Up Feedback)
-  // ----------------------------------------------------
-  const triggerAiHelper = async (errorMessage) => {
+  // Restore saved player progression when session is active
+  const restoreUserProgress = useCallback(async (name, dob) => {
+    if (!name || !dob) return;
+    setIsLoadingPlayer(true);
+    setSyncStatus('syncing');
     try {
-      const keyHelper = import.meta.env.VITE_GEMINI_API_KEY_HELPER || import.meta.env.VITE_GEMINI_API_KEY;
-      if (!keyHelper) return;
-
-      const prompt = `Student Task: "${currentQuest.description}"
-      Student Code:
-      ${userCode}
-      Execution Error/Output:
-      ${errorMessage}
-
-      Act as an encouraging Python Tutor Helper. Explain in 2 concise bullet points:
-      1. What went wrong in simple terms.
-      2. The exact conceptual fix without giving away the direct full code answer.`;
-
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${keyHelper}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      const saved = await loadPlayerProgress(name, dob);
+      if (saved) {
+        if (Array.isArray(saved.completedLevels) && saved.completedLevels.length > 0) {
+          setCompletedLevels(saved.completedLevels);
+        } else {
+          setCompletedLevels([]);
         }
-      );
 
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error?.message || `API error (${response.status})`);
-      }
-
-      if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
-        setHelperFeedback(data.candidates[0].content.parts[0].text);
-        setIsHelperOpen(true);
-      }
-    } catch (e) {
-      console.error("Helper API Error:", e.message || e);
-    }
-  };
-
-  // Run Code Execution Engine
-  // Trigger side poppers confetti
-  const triggerVictoryPoppers = () => {
-    // Left popper
-    confetti({
-      particleCount: 50,
-      angle: 60,
-      spread: 55,
-      origin: { x: 0, y: 0.7 }
-    });
-    // Right popper
-    confetti({
-      particleCount: 50,
-      angle: 120,
-      spread: 55,
-      origin: { x: 1, y: 0.7 }
-    });
-  };
-  // Play a quick 1-second victory sound effect using Web Audio API
-  const playVictorySound = () => {
-    try {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContext) return;
-      const ctx = new AudioContext();
-
-      // Notes for a classic victory jingle (C5, E5, G5, C6)
-      const notes = [523.25, 659.25, 783.99, 1046.50];
-      const duration = 0.18; // ~0.7 seconds total duration
-
-      notes.forEach((freq, index) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-
-        osc.type = 'triangle'; // Gives a warm game synth tone
-        osc.frequency.value = freq;
-
-        const startTime = ctx.currentTime + index * duration;
-        const stopTime = startTime + duration;
-
-        gain.gain.setValueAtTime(0.15, startTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, stopTime);
-
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-
-        osc.start(startTime);
-        osc.stop(stopTime);
-      });
-    } catch (e) {
-      console.log('Audio playback error:', e);
-    }
-  };
-  const runCode = async () => {
-    if (!pyodide) return;
-    setStatus('⏳ Running code...');
-    const currentAttempt = attempts + 1;
-    setAttempts(currentAttempt);
-
-    try {
-      await pyodide.runPythonAsync(`
-import sys
-import io
-sys.stdout = io.StringIO()
-      `);
-
-      await pyodide.runPythonAsync(userCode);
-      const printedOutput = await pyodide.runPythonAsync(`sys.stdout.getvalue().strip()`);
-
-      if (printedOutput === currentQuest.expectedOutput) {
-        setIsTimerRunning(false);
-        setIsLevelCleared(true);
-        triggerVictoryPoppers();
-        playVictorySound();
-
-        // Calculate Star Rating based on speed (<45s = 3 stars) and 1st attempt
-        let earnedStars = 1;
-        if (currentAttempt === 1 && timer <= 45) earnedStars = 3;
-        else if (currentAttempt <= 2 && timer <= 90) earnedStars = 2;
-        setStars(earnedStars);
-
-        const baseReward = 50;
-        const totalAwardedXp = baseReward + (earnedStars * 10);
-        setXp((prev) => prev + totalAwardedXp);
-
-        setStatus(`🎉 Level Cleared! Stars: ${'⭐'.repeat(earnedStars)} (+${totalAwardedXp} XP)`);
-        saveProgressToDb(currentLevel, xp + totalAwardedXp);
+        if (typeof saved.currentLevelIndex === 'number' && saved.currentLevelIndex >= 0) {
+          const restoredIndex = Math.min(saved.currentLevelIndex, quests.length - 1);
+          setCurrentQuestIndex(restoredIndex);
+          setUserCode(saved.lastCode || quests[restoredIndex]?.starterCode || starterQuests[0].starterCode);
+          setStatus(`Welcome back, ${name}! Resumed at Stage ${restoredIndex + 1}.`);
+        } else {
+          setCurrentQuestIndex(0);
+          setUserCode(quests[0]?.starterCode || starterQuests[0].starterCode);
+          setStatus(`Welcome, ${name}! Your Python journey begins.`);
+        }
       } else {
-        // XP Penalty on multiple failed attempts
-        if (currentAttempt > 2) {
-          setXp((prev) => Math.max(0, prev - 5));
-        }
-        const mismatchError = `Output mismatch!\nExpected: "${currentQuest.expectedOutput}"\nGot: "${printedOutput}"`;
-        setStatus(`❌ ${mismatchError}`);
-        triggerAiHelper(mismatchError);
+        // Fresh player profile
+        setCurrentQuestIndex(0);
+        setCompletedLevels([]);
+        setUserCode(quests[0]?.starterCode || starterQuests[0].starterCode);
+        setStatus(`Welcome, ${name}! Your Python journey begins.`);
       }
+      setSyncStatus('saved');
     } catch (err) {
-      if (currentAttempt > 2) {
-        setXp((prev) => Math.max(0, prev - 5));
-      }
-      setStatus(`⚠️ Python Syntax Error on line ${err.lineNumber || 'code block'}`);
-      triggerAiHelper(err.message);
+      console.warn('Progress restoration notice:', err);
+      setSyncStatus('saved');
+    } finally {
+      setIsLoadingPlayer(false);
     }
-  };
+  }, [quests]);
 
-  // ----------------------------------------------------
-  // API KEY 1 & 3: TASK GENERATOR & REAL-WORLD CAPSTONE AGENTS
-  // ----------------------------------------------------
-  const generateNextQuest = async () => {
-    setIsGeneratingNext(true);
-    setStatus('🤖 Crafting your next challenge...');
-    setIsLevelCleared(false);
-    setIsHelperOpen(false);
-    setUnlockedHints([]);
-    setAttempts(0);
-    setTimer(0);
-    setIsTimerRunning(true);
+  // Handle active session restore on mount
+  useEffect(() => {
+    if (session?.playerName && session?.dob) {
+      restoreUserProgress(session.playerName, session.dob);
+    }
+  }, [session, restoreUserProgress]);
 
-    const nextLevelNum = currentLevel + 1;
-    const isCapstone = nextLevelNum >= 5; // Level 5+ triggers Capstone Real-World API
-
-    // Choose key based on level progression
-    const apiKey = isCapstone
-      ? (import.meta.env.VITE_GEMINI_API_KEY_CAPSTONE || import.meta.env.VITE_GEMINI_API_KEY)
-      : (import.meta.env.VITE_GEMINI_API_KEY_TEACHER || import.meta.env.VITE_GEMINI_API_KEY);
-
-    const prompt = isCapstone
-      ? `You are an Advanced Software Engineer. Generate Level ${nextLevelNum}: A REAL-WORLD INDUSTRY PROBLEM.
-         Make sure the description clearly states the EXACT value/format required.
-         Return ONLY raw JSON:
-         {
-           "level": ${nextLevelNum},
-           "title": "Level ${nextLevelNum}: Capstone Challenge",
-           "topic": "Real-World Engineering",
-           "description": "Clear real-world prompt with explicit instructions. Wrap code keywords in backticks like \`user_name\`.",
-           "starterCode": "# Real-world boilerplate code\\n",
-           "expectedOutput": "exact_expected_stdout_string",
-           "hint": "Engineering guidance hint"
-         }`
-      : `You are a Strict, Adaptive Human Python Teacher.
-         
-         PLAYER PERFORMANCE REPORT:
-         - Current Level Completed: ${currentLevel}
-         - Topic Just Tested: "${currentQuest.topic}"
-         - Total Failed Attempts Before Passing: ${attempts}
-
-         TEACHING RULES:
-         1. IF attempts > 1 (the student struggled or failed multiple times on level ${currentLevel}):
-            - DO NOT jump to a new topic.
-            - Generate Level ${nextLevelNum} as a REINFORCEMENT PRACTICE task on the EXACT SAME TOPIC ("${currentQuest.topic}").
-            - Give them a fresh, different scenario using the same concepts so they can master it.
-
-         2. IF attempts <= 1 (the student passed easily):
-            - Move forward smoothly to the next logical Python concept.
-
-         Return ONLY raw JSON with NO markdown wrapping:
-         {
-           "level": ${nextLevelNum},
-           "title": "Level ${nextLevelNum}: Title Here",
-           "topic": "Topic Name",
-           "description": "Clear challenge briefing (wrap code keywords in backticks like \`energy\`).",
-           "starterCode": "# Starter code\\n",
-           "expectedOutput": "exact_expected_stdout_string",
-           "hint": "Helpful hint"
-         }`;
+  // Strict Login handler with Name & DOB uniqueness validation
+  const handleLogin = async (name, dob) => {
+    setAuthError('');
+    setIsLoadingPlayer(true);
 
     try {
-      if (!apiKey) {
-        throw new Error("Gemini API key is not configured in environment variables.");
+      const authResult = await verifyOrRegisterPlayer(name, dob);
+
+      if (!authResult.success) {
+        setAuthError(authResult.error || 'Authentication error. Please try again.');
+        setIsLoadingPlayer(false);
+        return;
       }
 
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      // Success
+      setActiveSession(name, dob);
+      setPlayerName(name);
+      setPlayerDob(dob);
+      setSession({ playerName: name, dob });
+      setIsLoggedIn(true);
+
+      if (authResult.progress) {
+        const saved = authResult.progress;
+        if (Array.isArray(saved.completedLevels)) {
+          setCompletedLevels(saved.completedLevels);
         }
-      );
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error?.message || `API Error (${response.status})`);
+        if (typeof saved.currentLevelIndex === 'number') {
+          const idx = Math.min(saved.currentLevelIndex, quests.length - 1);
+          setCurrentQuestIndex(idx);
+          setUserCode(saved.lastCode || quests[idx]?.starterCode || starterQuests[0].starterCode);
+          setStatus(`Welcome back, ${name}! Resumed at Stage ${idx + 1}.`);
+        }
+      } else {
+        setCurrentQuestIndex(0);
+        setCompletedLevels([]);
+        setUserCode(quests[0]?.starterCode || starterQuests[0].starterCode);
+        setStatus(`Welcome, ${name}! New profile registered.`);
       }
-
-      if (!data.candidates?.[0]?.content?.parts?.[0]?.text) {
-        throw new Error("Invalid response format received from Gemini API.");
-      }
-
-      const rawText = data.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim();
-      const nextQuest = JSON.parse(rawText);
-
-      setCurrentLevel(nextLevelNum);
-      setCurrentQuest(nextQuest);
-      setUserCode(nextQuest.starterCode);
-      setStatus(`🎯 Level ${nextLevelNum} (${isCapstone ? '🚀 Capstone' : '📖 Guided'}) Ready!`);
     } catch (err) {
-      console.error("Task Generator Error:", err.message || err);
-      const fallbackQuest = {
-        level: nextLevelNum,
-        title: `Level ${nextLevelNum}: Working with Variables`,
-        topic: "Variables",
-        description: "Create a variable named 'course' and set it to 'Python', then print 'course'.",
-        starterCode: `# Create variable and print it\n`,
-        expectedOutput: "Python",
-        hint: "Write course = 'Python' and print(course)"
-      };
-      setCurrentLevel(nextLevelNum);
-      setCurrentQuest(fallbackQuest);
-      setUserCode(fallbackQuest.starterCode);
-      setStatus(`🎯 Level ${nextLevelNum} Ready!`);
+      setAuthError('Could not connect to authentication service. Please check your network.');
     } finally {
-      setIsGeneratingNext(false);
+      setIsLoadingPlayer(false);
     }
   };
 
-  const useHint = () => {
-    if (xp < 10 && unlockedHints.length === 0) {
-      alert("You need at least 10 XP to unlock a hint!");
+  // Logout handler
+  const handleLogout = () => {
+    clearActiveSession();
+    setSession(null);
+    setIsLoggedIn(false);
+    setPlayerName('');
+    setPlayerDob('');
+    setAuthError('');
+    setCurrentQuestIndex(0);
+    setCompletedLevels([]);
+    setUserCode(starterQuests[0].starterCode);
+    setCurrentView('map');
+  };
+
+  // Persist progression whenever completedLevels, currentQuestIndex, or code changes
+  const persistCurrentProgress = useCallback(
+    async (overrideIndex, overrideCompleted, overrideCode, overrideSpentXp) => {
+      if (!isLoggedIn || !playerName || !playerDob) return;
+
+      setSyncStatus('syncing');
+      const idx = overrideIndex !== undefined ? overrideIndex : currentQuestIndex;
+      const completed = overrideCompleted !== undefined ? overrideCompleted : completedLevels;
+      const code = overrideCode !== undefined ? overrideCode : userCode;
+      const usedXp = overrideSpentXp !== undefined ? overrideSpentXp : spentXp;
+
+      const gross = completed.reduce((sum, qId) => {
+        const q = quests.find((item) => item.id === qId);
+        return sum + (q?.xp || 100);
+      }, 0);
+
+      const netXp = Math.max(0, gross - usedXp);
+      const stars = completed.length * 3;
+
+      const res = await savePlayerProgress({
+        playerName,
+        dob: playerDob,
+        currentLevelIndex: idx,
+        completedLevels: completed,
+        totalXp: netXp,
+        totalStars: stars,
+        lastCode: code
+      });
+
+      setSyncStatus(res?.isCloud ? 'saved' : 'saved');
+    },
+    [isLoggedIn, playerName, playerDob, currentQuestIndex, completedLevels, userCode, spentXp, quests]
+  );
+
+  const handleUpdatePlayerName = (newName) => {
+    setPlayerName(newName);
+    setActiveSession(newName, playerDob);
+  };
+
+  const handleSelectLevel = (index) => {
+    if (index >= 0 && index < quests.length) {
+      setCurrentQuestIndex(index);
+      setUserCode(quests[index].starterCode);
+      setOutput('');
+      setHintNotification('');
+      setStatus(`Entering Stage ${index + 1}: ${quests[index].title}...`);
+      setFeedback('Execute your Python code to master this trial!');
+      setCurrentView('game');
+
+      persistCurrentProgress(index, completedLevels, quests[index].starterCode);
+    }
+  };
+
+  // GEMINI AI HINT ORACLE (SPENDING 50 XP FOR CUSTOM CODE HINT)
+  const handleRequestGeminiHint = async (cost = 50) => {
+    if (playerTotalXp < cost) {
+      setHintNotification(`⚠️ You need at least ${cost} XP to summon the Oracle. Clear earlier stages to earn more XP!`);
       return;
     }
-    if (!unlockedHints.includes(currentQuest.hint)) {
-      setXp((prev) => Math.max(0, prev - 10));
-      setUnlockedHints([...unlockedHints, currentQuest.hint]);
-    }
-  };
 
-  const saveProgressToDb = async (level, updatedXp) => {
-    if (!supabase || !username) return;
+    setIsLoadingAiHint(true);
+    setHintNotification('');
+
     try {
-      await supabase.from('profiles').upsert(
-        { username: username, total_xp: updatedXp, completed_quests: [level] },
-        { onConflict: 'username' }
-      );
-    } catch (e) {
-      console.log('Database sync offline.');
+      const hint = await generateGeminiHint({
+        quest: currentQuest,
+        userCode: userCode
+      });
+
+      const newSpent = spentXp + cost;
+      setSpentXp(newSpent);
+      setAiHints((prev) => ({
+        ...prev,
+        [currentQuest.id]: hint
+      }));
+
+      setHintNotification(`🔮 Oracle guidance unlocked (-${cost} XP)!`);
+
+      // Persist updated XP
+      persistCurrentProgress(currentQuestIndex, completedLevels, userCode, newSpent);
+    } catch (err) {
+      setHintNotification('⚠️ Could not consult the Oracle right now. Please try again.');
+    } finally {
+      setIsLoadingAiHint(false);
     }
   };
-  const handlePlayerLogin = async (e) => {
-    e.preventDefault();
-    const cleanName = inputUsername.trim();
-    if (!cleanName) return;
 
-    setUsername(cleanName);
+  const runCode = async () => {
+    if (!pyodide || !currentQuest) return;
 
-    if (supabase) {
-      try {
-        const { data, error } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('username', cleanName)
-          .maybesingle();
+    setStatus('Running Python code in WebAssembly engine...');
+    setOutput('');
 
-        if (data && !error) {
-          if (data.total_xp !== undefined) setXp(data.total_xp);
-          if (data.completed_quests && data.completed_quests.length > 0) {
-            const lastLevel = Math.max(...data.completed_quests);
-            setCurrentLevel(lastLevel);
-          }
-        } else {
-          await supabase.from('profiles').upsert(
-            { username: cleanName, total_xp: 100, completed_quests: [1] },
-            { onConflict: 'username' }
-          );
+    try {
+      pyodide.globals.set('user_code', userCode);
+      const result = await pyodide.runPythonAsync(`
+import sys
+from io import StringIO
+
+buffer = StringIO()
+old_stdout = sys.stdout
+sys.stdout = buffer
+try:
+    exec(user_code)
+finally:
+    sys.stdout = old_stdout
+
+output = buffer.getvalue().strip()
+output
+`);
+
+      const actualOutput = String(result ?? '').trim();
+      setOutput(actualOutput);
+
+      if (actualOutput === currentQuest.expectedOutput) {
+        const isNewlyCompleted = !completedLevels.includes(currentQuest.id);
+        const updatedCompleted = isNewlyCompleted
+          ? [...completedLevels, currentQuest.id]
+          : completedLevels;
+
+        if (isNewlyCompleted) {
+          setCompletedLevels(updatedCompleted);
         }
-      } catch (err) {
-        console.log('Error loading player profile:', err);
+
+        setStatus(`⚔️ Quest Cleared! Stage ${currentQuestIndex + 1} (${currentQuest.title}) complete.`);
+        setFeedback(`Trial mastered! +${currentQuest.xp || 100} XP earned.`);
+        setShowVictoryModal(true);
+
+        persistCurrentProgress(currentQuestIndex, updatedCompleted, userCode);
+      } else {
+        setStatus(`Not quite yet. Expected "${currentQuest.expectedOutput}".`);
+        setFeedback(currentQuest.hint);
       }
+    } catch (error) {
+      setStatus(`Execution error: ${error.message}`);
+      setOutput('');
+      setFeedback('Check your syntax and try again.');
     }
-
-    setIsRegistered(true);
   };
+
+  const goToNextLevel = () => {
+    setShowVictoryModal(false);
+    if (!currentQuest) return;
+
+    if (currentQuestIndex < quests.length - 1) {
+      const nextIndex = currentQuestIndex + 1;
+      setCurrentQuestIndex(nextIndex);
+      setUserCode(quests[nextIndex].starterCode);
+      setStatus(`Quest ${nextIndex + 1} unlocked.`);
+      setOutput('');
+      setFeedback('New trial prepared.');
+      setHintNotification('');
+      setCurrentView('game');
+
+      persistCurrentProgress(nextIndex, completedLevels, quests[nextIndex].starterCode);
+    } else {
+      generateEndlessCapstoneQuest();
+    }
+  };
+
+  // GEMINI POWERED ENDLESS CAPSTONE GENERATOR
+  const generateEndlessCapstoneQuest = async () => {
+    setIsGeneratingTask(true);
+    setStatus('🌌 Gemini AI Architect is generating a real-world Capstone Project...');
+
+    try {
+      const geminiCapstone = await generateGeminiCapstoneProject(quests.length);
+      const newCapstone = geminiCapstone || generateNextCapstoneQuest(quests.length);
+
+      const nextIndex = quests.length;
+      setQuests((prev) => [...prev, newCapstone]);
+      setCurrentQuestIndex(nextIndex);
+      setUserCode(newCapstone.starterCode);
+      setStatus(`🌌 Gemini Capstone Stage ${nextIndex + 1}: "${newCapstone.title}" unlocked!`);
+      setFeedback('Real-world engineering challenge ready.');
+      setCurrentView('game');
+
+      persistCurrentProgress(nextIndex, completedLevels, newCapstone.starterCode);
+    } catch (e) {
+      const fallbackCapstone = generateNextCapstoneQuest(quests.length);
+      const nextIndex = quests.length;
+      setQuests((prev) => [...prev, fallbackCapstone]);
+      setCurrentQuestIndex(nextIndex);
+      setUserCode(fallbackCapstone.starterCode);
+      setCurrentView('game');
+    } finally {
+      setIsGeneratingTask(false);
+    }
+  };
+
+  // IF NOT LOGGED IN, PROMPT PLAYER FOR NAME AND DOB
+  if (!isLoggedIn) {
+    return (
+      <LoginScreen
+        onLogin={handleLogin}
+        initialName=""
+        initialDob=""
+        isLoading={isLoadingPlayer}
+        authError={authError}
+      />
+    );
+  }
+
   return (
-    <div className="h-screen w-screen bg-slate-950 text-white flex flex-col font-sans overflow-hidden relative">
-      {/* Registration Modal Overlay */}
-      {!isRegistered && (
-        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-50 flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 p-8 rounded-2xl max-w-md w-full shadow-2xl text-center">
-            <h2 className="text-3xl font-black text-amber-400 mb-2">🐍 PYTHON QUEST</h2>
-            <p className="text-slate-300 text-sm mb-6">Enter a player username to save progress & synchronize stats with the database.</p>
+    <>
+      {/* Global Leaderboard Modal */}
+      <LeaderboardModal
+        isOpen={showLeaderboardModal}
+        onClose={() => setShowLeaderboardModal(false)}
+        playerXp={playerTotalXp}
+        playerStars={playerTotalStars}
+        playerCompletedCount={completedLevels.length}
+        playerName={playerName}
+        onUpdatePlayerName={handleUpdatePlayerName}
+      />
 
-            <form onSubmit={handlePlayerLogin}>
-              <input
-                type="text"
-                placeholder="Enter Username (e.g. ShadowCoder)"
-                value={inputUsername}
-                onChange={(e) => setInputUsername(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-amber-500 mb-4 text-center font-mono"
-                required
-              />
-              <button
-                type="submit"
-                className="w-full bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-black py-3.5 rounded-xl transition text-base"
-              >
-                Start Quest & Save Progress →
-              </button>
-            </form>
-          </div>
-        </div>
+      {/* Victory Celebration Modal */}
+      {showVictoryModal && (
+        <VictoryModal
+          quest={currentQuest}
+          hasNextLevel={true}
+          onNextLevel={goToNextLevel}
+          onReturnToMap={() => {
+            setShowVictoryModal(false);
+            setCurrentView('map');
+          }}
+        />
       )}
-      {/* Header HUD with Player Name */}
-      <header className="h-16 bg-slate-900 border-b border-slate-800 px-6 flex justify-between items-center shrink-0">
-        <div className="flex items-center gap-3">
-          <h1 className="text-xl font-black text-amber-400 tracking-wide">🐍 PYTHON QUEST</h1>
-          <button
-            onClick={toggleSound}
-            className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-mono transition border border-slate-700 flex items-center gap-1.5"
-            title="Toggle Background Music"
-          >
-            {isMuted ? '🔇 Music Off' : '🎵 Music On'}
-          </button>
-          <span className="text-xs bg-slate-800 border border-slate-700 text-slate-300 px-2.5 py-1 rounded-full font-bold">
-            {currentQuest.title}
-          </span>
-          {currentLevel >= 5 && (
-            <span className="text-xs bg-purple-500/20 text-purple-300 border border-purple-500/40 px-2.5 py-1 rounded-full font-black animate-pulse">
-              🚀 Capstone Mode
-            </span>
-          )}
-        </div>
 
-        <div className="flex items-center gap-4">
-          {/* Active Player Name Badge */}
-          {username && (
-            <div className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-lg text-xs font-bold text-slate-300 flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-              <span className="text-slate-400">Player:</span>
-              <span className="text-amber-400 font-mono text-sm">{username}</span>
-            </div>
-          )}
+      {/* VIEW 1: 100+ CAPSTONE REALM MAP */}
+      {currentView === 'map' && (
+        <LevelMap
+          quests={quests}
+          completedLevels={completedLevels}
+          currentQuestIndex={currentQuestIndex}
+          onSelectLevel={handleSelectLevel}
+          onGenerateAiQuest={generateEndlessCapstoneQuest}
+          onGenerateCapstoneQuest={generateEndlessCapstoneQuest}
+          onOpenLeaderboard={() => setShowLeaderboardModal(true)}
+          playerName={playerName}
+          playerDob={playerDob}
+          onLogout={handleLogout}
+          isGeneratingTask={isGeneratingTask}
+          isLoadingEngine={isLoadingEngine}
+        />
+      )}
 
-          {/* Live Timer Corner */}
-          <div className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-lg text-xs font-mono text-amber-300 flex items-center gap-1.5">
-            ⏱️ {Math.floor(timer / 60).toString().padStart(2, '0')}:{(timer % 60).toString().padStart(2, '0')}
-          </div>
+      {/* VIEW 2: QUEST CODING & TRIAL VIEW */}
+      {currentView === 'game' && (
+        <div className="min-h-screen bg-slate-950 p-4 sm:p-6 text-white font-sans selection:bg-cyan-500 selection:text-slate-950">
+          {/* Header Bar with Back to Map button */}
+          <header className="mx-auto mb-6 max-w-7xl rounded-2xl border border-slate-800 bg-slate-900/90 backdrop-blur-md p-4 shadow-xl">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setCurrentView('map')}
+                  className="flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-bold text-slate-200 transition hover:bg-slate-700 hover:text-white active:scale-95 shadow"
+                  title="Return to Realm Map"
+                >
+                  <span>🗺️</span>
+                  <span>Quest Map</span>
+                </button>
 
-          <div className="text-xs font-bold text-slate-400">
-            Engine: {isLoadingEngine ? <span className="text-amber-400">⏳ Loading...</span> : <span className="text-emerald-400">🟢 Ready</span>}
-          </div>
-
-          <div className="bg-slate-800 px-3.5 py-1.5 rounded-lg border border-slate-700 font-extrabold text-emerald-400 text-xs">
-            ⚡ {xp} XP
-          </div>
-        </div>
-      </header>
-
-      {/* Main Split Screen */}
-      <div className="flex-1 grid grid-cols-1 md:grid-cols-2 overflow-hidden">
-        {/* Left Panel: Briefing */}
-        <div className="bg-slate-900/60 border-r border-slate-800 p-6 flex flex-col justify-between overflow-y-auto">
-          <div>
-            <div className="flex justify-between items-center mb-4">
-              <span className="text-xs font-bold text-amber-400 uppercase tracking-wider">
-                Topic: {currentQuest.topic}
-              </span>
-              <span className="text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded">
-                +50 XP
-              </span>
-            </div>
-
-            <h2 className="text-2xl font-bold text-slate-100 mb-4">{currentQuest.title}</h2>
-            <p className="text-slate-300 text-base leading-relaxed mb-6">
-              {renderTaskDescription(currentQuest.description)}
-            </p>
-
-            {/* Stars Unlocked Banner */}
-            {isLevelCleared && (
-              <div className="bg-emerald-950/40 border border-emerald-500/30 p-4 rounded-xl mb-4 text-center">
-                <div className="text-3xl mb-1">{'⭐'.repeat(stars)}</div>
-                <div className="text-xs text-emerald-300 font-bold uppercase tracking-wider">
-                  {stars === 3 ? 'Perfect Performance!' : stars === 2 ? 'Great Speed!' : 'Level Cleared!'}
+                <div className="flex items-center gap-2.5">
+                  <span className={`flex h-10 w-10 items-center justify-center rounded-xl text-2xl border ${currentQuest?.isCapstone || currentQuestIndex >= 100
+                      ? 'bg-indigo-950/80 border-cyan-500/40 text-cyan-300'
+                      : 'bg-emerald-950/80 border-emerald-500/30'
+                    }`}>
+                    {currentQuest?.icon || '🐍'}
+                  </span>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className={`text-[11px] font-bold uppercase tracking-wider ${currentQuest?.isCapstone || currentQuestIndex >= 100 ? 'text-cyan-400' : 'text-emerald-400'
+                        }`}>
+                        {currentQuest?.world}
+                      </span>
+                      <span className={`rounded px-1.5 py-0.2 text-[10px] font-mono ${currentQuest?.isCapstone || currentQuestIndex >= 100
+                          ? 'bg-indigo-950 text-cyan-300 border border-cyan-500/30'
+                          : 'bg-slate-800 text-emerald-300'
+                        }`}>
+                        {currentQuest?.concept}
+                      </span>
+                    </div>
+                    <h1 className="text-xl font-black text-white sm:text-2xl">
+                      Stage {currentQuestIndex + 1}: {currentQuest?.title}
+                    </h1>
+                  </div>
                 </div>
               </div>
-            )}
 
-            {unlockedHints.length > 0 && (
-              <div className="bg-amber-950/30 border border-amber-500/40 p-4 rounded-xl mb-4">
-                <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-2">💡 Unlocked Hint (-10 XP)</h3>
-                {unlockedHints.map((hint, idx) => (
-                  <p key={idx} className="text-sm text-amber-200/90 font-mono bg-slate-950 p-3 rounded-lg border border-slate-800">
-                    {hint}
+              {/* Quest indicator, Cloud Sync, Leaderboard & progress */}
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Adventurer Profile Pill */}
+                <div className="flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-xs text-slate-300">
+                  <span className="text-cyan-300">👤 {playerName}</span>
+                  {playerDob && <span className="text-[10px] text-slate-500 font-mono">({playerDob})</span>}
+                  <button
+                    onClick={handleLogout}
+                    className="ml-1 text-[10px] text-red-400 hover:underline font-bold"
+                    title="Logout / Switch Player"
+                  >
+                    [Exit]
+                  </button>
+                </div>
+
+                {/* Cloud Sync Status */}
+                <div className="flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-[11px] font-mono text-slate-300">
+                  <span className={`h-2 w-2 rounded-full ${syncStatus === 'syncing' ? 'bg-amber-400 animate-ping' : 'bg-emerald-400'}`} />
+                  <span>{syncStatus === 'syncing' ? 'Syncing...' : '☁️ Synced'}</span>
+                </div>
+
+                <button
+                  onClick={() => setShowLeaderboardModal(true)}
+                  className="flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-950/40 px-3 py-1 text-xs font-bold text-amber-300 transition hover:scale-105 hover:border-amber-300"
+                >
+                  <span>🏆</span>
+                  <span>Rankings</span>
+                </button>
+
+                <div className="rounded-full border border-cyan-700 bg-cyan-950/60 px-3.5 py-1 text-xs font-bold text-cyan-300 font-mono">
+                  Level {currentQuestIndex + 1} of {quests.length}
+                </div>
+
+                <div className="rounded-full border border-amber-500/30 bg-amber-950/50 px-3 py-1 text-xs font-bold text-amber-300 font-mono">
+                  💎 {playerTotalXp.toLocaleString()} XP
+                </div>
+              </div>
+            </div>
+
+            {/* Progress Bar */}
+            <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-800 border border-slate-800">
+              <div
+                className="h-2 rounded-full bg-gradient-to-r from-emerald-500 via-cyan-400 to-purple-400 transition-all duration-500"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+          </header>
+
+          {/* Two-Column Play Workspace */}
+          <div className="mx-auto grid max-w-7xl grid-cols-1 gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+            {/* Left: Quest Briefing & Task Goal */}
+            <section className="rounded-2xl border border-slate-800 bg-slate-900/90 backdrop-blur-md p-6 shadow-xl flex flex-col justify-between">
+              <div>
+                <div className="mb-4 flex items-center justify-between">
+                  <p className={`text-xs uppercase tracking-[0.3em] font-bold ${currentQuest?.isCapstone || currentQuestIndex >= 100 ? 'text-cyan-400' : 'text-emerald-400'
+                    }`}>
+                    {currentQuest?.isCapstone ? 'Capstone Engineering Objective' : `Quest Objective #${currentQuestIndex + 1}`}
                   </p>
-                ))}
+                  <span className={`rounded-full border px-2.5 py-0.5 text-xs font-semibold ${completedLevels.includes(currentQuest?.id)
+                      ? 'border-emerald-500/40 bg-emerald-950/40 text-emerald-300'
+                      : 'border-amber-500/30 bg-amber-950/30 text-amber-300'
+                    }`}>
+                    {completedLevels.includes(currentQuest?.id) ? '✓ Mastered' : '● In Progress'}
+                  </span>
+                </div>
+
+                <h2 className="text-2xl font-bold text-white">
+                  {currentQuest?.taskName || currentQuest?.title}
+                </h2>
+                <p className="mt-3 text-sm leading-relaxed text-slate-300">
+                  {currentQuest?.description}
+                </p>
+
+                {/* Standard Hint Box */}
+                <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/80 p-4">
+                  <p className="text-xs uppercase tracking-[0.2em] font-semibold text-slate-400 flex items-center gap-1">
+                    <span>💡</span> Quest Hint
+                  </p>
+                  <p className="mt-1.5 text-sm text-amber-300">
+                    {currentQuest?.hint}
+                  </p>
+                </div>
+
+                {/* GEMINI AI HINT ORACLE (XP SPENDING) */}
+                <div className="mt-4 rounded-xl border border-purple-500/40 bg-gradient-to-r from-purple-950/40 via-slate-950 to-indigo-950/40 p-4 shadow-lg">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs uppercase tracking-[0.2em] font-bold text-purple-300 flex items-center gap-1.5">
+                      <span className="text-base animate-pulse">🔮</span> Gemini AI Oracle
+                    </p>
+
+                    {aiHints[currentQuest.id] ? (
+                      <button
+                        onClick={() => handleRequestGeminiHint(25)}
+                        disabled={isLoadingAiHint}
+                        className="text-[11px] font-bold text-purple-300 hover:text-purple-200 underline font-mono disabled:opacity-50"
+                      >
+                        {isLoadingAiHint ? 'Thinking...' : '🔄 Re-Analyze Code (-25 XP)'}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => handleRequestGeminiHint(50)}
+                        disabled={isLoadingAiHint}
+                        className="flex items-center gap-1.5 rounded-lg border border-purple-400/60 bg-purple-900/40 px-3 py-1 text-xs font-bold text-purple-200 shadow hover:bg-purple-800/60 transition disabled:opacity-50 active:scale-95"
+                      >
+                        <span>{isLoadingAiHint ? '🔮 Consulting Oracle...' : '🔮 Unlock AI Code Hint (-50 XP)'}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {hintNotification && (
+                    <p className="mt-2 text-xs font-medium text-amber-300">
+                      {hintNotification}
+                    </p>
+                  )}
+
+                  {aiHints[currentQuest.id] ? (
+                    <div className="mt-2.5 rounded-lg border border-purple-800/50 bg-slate-950/90 p-3">
+                      <p className="text-xs text-purple-200 leading-relaxed">
+                        {aiHints[currentQuest.id]}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="mt-1.5 text-xs text-slate-400">
+                      Stuck? Spend 50 XP to let the Gemini Oracle analyze your code and provide targeted guidance!
+                    </p>
+                  )}
+                </div>
+
+                {/* Goal Box */}
+                <div className={`mt-4 rounded-xl border p-4 ${currentQuest?.isCapstone || currentQuestIndex >= 100
+                    ? 'border-cyan-800/60 bg-cyan-950/30'
+                    : 'border-emerald-800/60 bg-emerald-950/30'
+                  }`}>
+                  <p className={`text-xs uppercase tracking-[0.2em] font-semibold flex items-center gap-1 ${currentQuest?.isCapstone || currentQuestIndex >= 100 ? 'text-cyan-400' : 'text-emerald-400'
+                    }`}>
+                    <span>🎯</span> Expected Terminal Output
+                  </p>
+                  <p className={`mt-1.5 font-mono text-sm px-3 py-1.5 rounded border inline-block whitespace-pre-wrap ${currentQuest?.isCapstone || currentQuestIndex >= 100
+                      ? 'bg-slate-950/80 text-cyan-300 border-cyan-900/40'
+                      : 'bg-slate-950/60 text-emerald-300 border-emerald-900/40'
+                    }`}>
+                    {currentQuest?.expectedOutput}
+                  </p>
+                </div>
               </div>
-            )}
-          </div>
 
-          <button
-            onClick={useHint}
-            disabled={unlockedHints.length > 0}
-            className="w-full bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-amber-400 font-bold py-3 rounded-xl border border-slate-700 text-sm transition"
-          >
-            {unlockedHints.length > 0 ? '💡 Hint Unlocked' : '💡 Unlock Hint (-10 XP)'}
-          </button>
-        </div>
+              {/* Action Buttons */}
+              <div className="mt-6 pt-4 border-t border-slate-800/80">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <button
+                    onClick={runCode}
+                    disabled={isLoadingEngine}
+                    className={`flex items-center justify-center gap-2 rounded-xl px-4 py-3 font-bold text-slate-950 shadow-lg transition hover:scale-[1.02] hover:brightness-110 active:scale-[0.98] disabled:opacity-50 ${currentQuest?.isCapstone || currentQuestIndex >= 100
+                        ? 'bg-gradient-to-r from-cyan-400 via-teal-300 to-indigo-300 shadow-cyan-500/30'
+                        : 'bg-gradient-to-r from-emerald-500 to-teal-400 shadow-emerald-500/20'
+                      }`}
+                  >
+                    <span>⚡</span>
+                    <span>{isLoadingEngine ? 'Loading Pyodide Engine...' : 'Run Python Code'}</span>
+                  </button>
 
-        {/* Right Panel: Prism Editor */}
-        <div className="bg-slate-950 p-6 flex flex-col justify-between overflow-hidden">
-          <div className="flex-1 flex flex-col mb-4">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Python Sandbox Editor</span>
+                  <button
+                    onClick={goToNextLevel}
+                    className={`flex items-center justify-center gap-2 rounded-xl border px-4 py-3 font-bold transition hover:bg-slate-800 active:scale-[0.98] ${currentQuest?.isCapstone || currentQuestIndex >= 100
+                        ? 'border-cyan-500/60 bg-cyan-500/10 text-cyan-300'
+                        : 'border-emerald-500/60 bg-emerald-500/10 text-emerald-300'
+                      }`}
+                  >
+                    <span>Next Level</span>
+                    <span>➔</span>
+                  </button>
+                </div>
 
-            <div className="relative flex-1 w-full rounded-xl border border-slate-800 bg-slate-900 overflow-hidden font-mono text-base">
-              <pre
-                aria-hidden="true"
-                className="absolute inset-0 p-4 pointer-events-none overflow-auto whitespace-pre-wrap break-words leading-relaxed m-0 text-slate-200"
-                dangerouslySetInnerHTML={{
-                  __html: Prism.highlight(userCode || '', Prism.languages.python, 'python') + '\n'
-                }}
-              />
-              <textarea
-                value={userCode}
-                onChange={(e) => setUserCode(e.target.value)}
-                onKeyDown={handleKeyDown}
-                className="absolute inset-0 w-full h-full p-4 bg-transparent text-transparent caret-emerald-400 font-mono text-base focus:outline-none resize-none leading-relaxed"
-                spellCheck="false"
-              />
-            </div>
-          </div>
+                <div className="mt-3 flex gap-2">
+                  <button
+                    onClick={() => setCurrentView('map')}
+                    className="w-1/2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2.5 text-xs font-semibold text-slate-300 transition hover:bg-slate-700 hover:text-white"
+                  >
+                    🗺️ Return to Map
+                  </button>
 
-          <div>
-            {!isLevelCleared ? (
-              <button
-                onClick={runCode}
-                disabled={isLoadingEngine}
-                className="w-full bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 text-slate-950 font-black py-3.5 rounded-xl transition text-base"
-              >
-                {isLoadingEngine ? '⏳ Loading Engine...' : '▶ Submit & Run Code'}
-              </button>
-            ) : (
-              <button
-                onClick={generateNextQuest}
-                disabled={isGeneratingNext}
-                className="w-full bg-amber-500 hover:bg-amber-600 text-slate-950 font-black py-3.5 rounded-xl transition text-base animate-pulse"
-              >
-                {isGeneratingNext ? '🤖 Crafting Next Level...' : '✨ Continue to Next Level →'}
-              </button>
-            )}
-
-            {status && (
-              <div className="mt-4 p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono whitespace-pre-wrap">
-                {status}
+                  <button
+                    onClick={generateEndlessCapstoneQuest}
+                    disabled={isGeneratingTask}
+                    className="w-1/2 rounded-xl border border-cyan-700/60 bg-cyan-950/40 px-4 py-2.5 text-xs font-semibold text-cyan-300 transition hover:bg-cyan-900/50 disabled:opacity-50"
+                  >
+                    {isGeneratingTask ? '🌌 Gemini Generating...' : '⚡ Gemini Capstone'}
+                  </button>
+                </div>
               </div>
-            )}
-          </div>
-        </div>
-      </div>
+            </section>
 
-      {/* POP-UP SIDE DRAWER: AI Tutor Helper */}
-      {isHelperOpen && (
-        <div className="fixed right-6 top-20 w-80 bg-slate-900 border border-amber-500/40 rounded-2xl p-5 shadow-2xl z-50 animate-slide-in">
-          <div className="flex justify-between items-center mb-3 border-b border-slate-800 pb-2">
-            <h3 className="text-sm font-black text-amber-400 flex items-center gap-2">
-              🤖 AI Tutor Helper
-            </h3>
-            <button
-              onClick={() => setIsHelperOpen(false)}
-              className="text-slate-400 hover:text-white font-bold text-lg"
-            >
-              ✕
-            </button>
-          </div>
-          <div className="text-xs text-slate-300 font-sans leading-relaxed">
-            {helperFeedback && renderTaskDescription(helperFeedback.replace(/\*\*/g, ''))}
+            {/* Right: Code Console & Terminal */}
+            <section className="flex flex-col rounded-2xl border border-slate-800 bg-slate-900/90 backdrop-blur-md p-6 shadow-xl">
+              <div className="flex items-center justify-between">
+                <h3 className={`text-base font-bold flex items-center gap-2 ${currentQuest?.isCapstone || currentQuestIndex >= 100 ? 'text-cyan-400' : 'text-emerald-400'
+                  }`}>
+                  <span>💻</span> Python Editor & Terminal
+                </h3>
+                <span className="text-[11px] font-mono text-slate-400">Pyodide WASM</span>
+              </div>
+
+              {/* Code Editor Textarea */}
+              <div className="relative mt-3">
+                <textarea
+                  value={userCode}
+                  onChange={(e) => setUserCode(e.target.value)}
+                  className={`h-56 w-full resize-none rounded-xl border border-slate-800 bg-slate-950 p-4 font-mono text-sm outline-none shadow-inner ${currentQuest?.isCapstone || currentQuestIndex >= 100
+                      ? 'text-cyan-300 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500'
+                      : 'text-emerald-400 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500'
+                    }`}
+                  spellCheck="false"
+                  placeholder="# Write your Python code here..."
+                />
+              </div>
+
+              {/* Console Output */}
+              <div className="mt-4 min-h-[110px] rounded-xl border border-slate-800 bg-slate-950 p-4 shadow-inner">
+                <p className="text-xs uppercase tracking-[0.2em] font-semibold text-slate-400 flex items-center gap-1.5">
+                  <span className={`h-2 w-2 rounded-full inline-block animate-pulse ${currentQuest?.isCapstone || currentQuestIndex >= 100 ? 'bg-cyan-400' : 'bg-emerald-500'
+                    }`} />
+                  Terminal Output
+                </p>
+                <pre className={`mt-2 whitespace-pre-wrap font-mono text-sm ${currentQuest?.isCapstone || currentQuestIndex >= 100 ? 'text-cyan-300' : 'text-emerald-300'
+                  }`}>
+                  {output || '> No output yet. Click "Run Python Code" to execute.'}
+                </pre>
+              </div>
+
+              {/* Status & Feedback */}
+              <div className="mt-3 flex flex-col gap-2">
+                <div className="rounded-lg border border-slate-800 bg-slate-950/80 px-3 py-2 text-xs text-slate-300">
+                  <span className="font-semibold text-slate-400">Status: </span>
+                  {status}
+                </div>
+
+                <div className="rounded-lg border border-cyan-900/40 bg-cyan-950/20 px-3 py-2 text-xs text-cyan-300">
+                  <span className="font-semibold text-cyan-400">Quest Guide: </span>
+                  {feedback}
+                </div>
+              </div>
+
+              {/* Quest Map Mini Roster */}
+              <div className="mt-5 pt-4 border-t border-slate-800">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs uppercase tracking-[0.2em] font-semibold text-slate-400">
+                    Quick Stage Select ({quests.length} Total)
+                  </p>
+                  <button
+                    onClick={() => setCurrentView('map')}
+                    className="text-xs text-cyan-400 hover:underline font-semibold"
+                  >
+                    Open Realm Map ➔
+                  </button>
+                </div>
+
+                <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1 scrollbar-thin">
+                  {quests.map((quest, index) => {
+                    const isCleared = completedLevels.includes(quest.id);
+                    const isCurrent = index === currentQuestIndex;
+                    const isUnlocked = index === 0 || completedLevels.includes(quests[index - 1]?.id) || isCleared;
+                    const isCapstone = quest.isCapstone || index >= 100;
+
+                    return (
+                      <button
+                        key={quest.id}
+                        disabled={!isUnlocked}
+                        onClick={() => handleSelectLevel(index)}
+                        className={`w-full flex items-center justify-between rounded-lg border px-3 py-1.5 text-xs transition ${isCurrent
+                            ? isCapstone
+                              ? 'border-cyan-500/60 bg-cyan-500/10 text-cyan-300 font-bold'
+                              : 'border-emerald-500/60 bg-emerald-500/10 text-emerald-300 font-bold'
+                            : isCleared
+                              ? isCapstone
+                                ? 'border-cyan-500/30 bg-cyan-950/20 text-slate-200 hover:border-cyan-400'
+                                : 'border-emerald-500/30 bg-emerald-950/20 text-slate-200 hover:border-emerald-400'
+                              : isUnlocked
+                                ? 'border-slate-800 bg-slate-950 text-slate-300 hover:border-slate-600'
+                                : 'border-slate-900 bg-slate-950/40 text-slate-600 cursor-not-allowed'
+                          }`}
+                      >
+                        <span className="truncate flex items-center gap-2">
+                          <span>{quest.icon || (isCapstone ? '🌌' : '🐍')}</span>
+                          <span>{index + 1}. {quest.title}</span>
+                        </span>
+                        <span>
+                          {isCleared ? '⭐ Mastered' : isCurrent ? '● Active' : isUnlocked ? 'Ready' : '🔒'}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
           </div>
         </div>
       )}
-      {/* Victory Pop-up Dialog */}
-      {isLevelCleared && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-          <div className="bg-slate-900 border-2 border-amber-500/50 p-8 rounded-3xl max-w-sm w-full shadow-2xl text-center relative animate-bounce-short">
-            <h2 className="text-3xl font-black text-amber-400 mb-1">LEVEL CLEARED!</h2>
-            <p className="text-slate-400 text-xs font-mono uppercase mb-6">Quest Completed</p>
-
-            {/* Stars Display */}
-            <div className="flex justify-center items-center gap-2 text-5xl mb-6">
-              <span className={stars >= 1 ? "scale-110 transition-transform duration-300" : "opacity-30 grayscale"}>⭐</span>
-              <span className={stars >= 2 ? "scale-125 transition-transform duration-300" : "opacity-30 grayscale"}>⭐</span>
-              <span className={stars >= 3 ? "scale-110 transition-transform duration-300" : "opacity-30 grayscale"}>⭐</span>
-            </div>
-
-            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 text-xs font-mono mb-6 text-slate-300">
-              {stars === 3 ? "🏆 Perfect Speed & 1st Attempt!" : stars === 2 ? "⚡ Great Timing!" : "👍 Well Done!"}
-            </div>
-
-            <button
-              onClick={generateNextQuest}
-              disabled={isGeneratingNext}
-              className="w-full bg-amber-500 hover:bg-amber-600 text-slate-950 font-black py-4 rounded-2xl text-lg transition shadow-lg hover:scale-105"
-            >
-              {isGeneratingNext ? '🤖 Loading Next...' : 'Next Level →'}
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+    </>
   );
 }
